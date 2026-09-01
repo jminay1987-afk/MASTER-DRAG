@@ -1,0 +1,126 @@
+);
+  if(String(pique.ronda)==="FINAL"&&pique.sin_ganador) throw new Error("Una FINAL sin ganador debe enviarse al Juez para resolución.");
+  const now=new Date().toISOString();
+  const up=await s.from("piques").update({estado:"CONFIRMADO",confirmado_at:now,decision_juez_pendiente:false}).eq("pique_id",piqueId).eq("estado","EN_CURSO").select("pique_id").maybeSingle();
+  if(up.error||!up.data) throw new Error("El pique cambió de estado y no pudo confirmarse.");
+  await applyConfirmedSportingFlow(s,u,{...pique,ganador_participacion_id:winner},lanes);
+  await advanceBracketFromPique(s,u,{...pique,pique_id:piqueId,ganador_participacion_id:winner});
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,entidad:"piques",entidad_id:piqueId,accion:"CRONO_CONFIRMA_PIQUE",datos_despues:{confirmado_at:now,ganador_participacion_id:winner,sin_ganador:pique.sin_ganador}});
+  revalidatePath("/admin/master-drag/cronometraje");
+}
+
+export async function sendPiqueToJudge(form:FormData){
+  const {s,u}=await operator();
+  if(!allowed(u.rol_global,"CRONOMETRAJE")) throw new Error("Sin permiso.");
+  const piqueId=txt(form.get("pique_id"));
+  const motivo=txt(form.get("motivo_revision"));
+  if(!piqueId||!motivo) throw new Error("Indica el motivo de la revisión.");
+  const up=await s.from("piques").update({estado:"EN_REVISION",motivo_revision:motivo,decision_juez_pendiente:true}).eq("pique_id",piqueId).eq("estado","EN_CURSO").select("pique_id").maybeSingle();
+  if(up.error||!up.data) throw new Error("Solo un pique EN CURSO puede enviarse a revisión.");
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,entidad:"piques",entidad_id:piqueId,accion:"CRONO_ENVIA_A_JUEZ",motivo});
+  revalidatePath("/admin/master-drag/cronometraje");
+  revalidatePath("/admin/master-drag/juez");
+}
+
+export async function judgeResolvePique(form:FormData){
+  const {s,u}=await operator();
+  if(!allowed(u.rol_global,"JUEZ")) throw new Error("Sin permiso para operar Juez.");
+  const piqueId=txt(form.get("pique_id"));
+  const motivo=txt(form.get("motivo"));
+  const outcome=txt(form.get("outcome"));
+  const limit=num(form.get("categoria_limite"));
+  if(!piqueId||!motivo) throw new Error("La decisión del Juez requiere fundamento.");
+  const {data:pique,error:pErr}=await s.from("piques").select("pique_id,categoria_fecha_id,estado,ronda,ganador_participacion_id,sin_ganador,motivo_revision").eq("pique_id",piqueId).single();
+  if(pErr||!pique||pique.estado!=="EN_REVISION"||!pique) throw new Error("El pique ya no está pendiente de revisión.");
+  const {data:lanes,error:lErr}=await s.from("pique_pilotos").select("pique_piloto_id,participacion_id,pista,tiempo_final_s,condicion,gana_pique,paso_primero_meta").eq("pique_id",piqueId).order("pista");
+  if(lErr||!lanes?.length) throw new Error("El pique no tiene pilotos asociados.");
+  const validParts=new Set(lanes.map((x:any)=>x.participacion_id));
+  if(outcome!=="SIN_GANADOR"&&!validParts.has(outcome)) throw new Error("Ganador inválido.");
+  if(String(pique.ronda)==="FINAL"&&outcome==="SIN_GANADOR") throw new Error("La Final debe resolverse con ganador o mediante repetición técnica.");
+  const before:any={pique,lanes};
+  for(const lane of lanes){
+    const condicion=txt(form.get(`condicion_${lane.pique_piloto_id}`));
+    const tiempo=num(form.get(`tiempo_${lane.pique_piloto_id}`));
+    if(!condicion) throw new Error("Debes definir la condición deportiva de cada pista.");
+    if(["VALIDO","CAIDO"].includes(condicion)&&tiempo==null) throw new Error("VÁLIDO o CAÍDO requiere tiempo final.");
+    if(limit!=null&&tiempo!=null&&condicion==="VALIDO"&&tiempo<limit) throw new Error(`El tiempo ${tiempo.toFixed(3)} es inferior al límite ${limit.toFixed(3)} y no puede quedar VÁLIDO.`);
+    if(limit!=null&&tiempo!=null&&condicion==="CAIDO"&&tiempo>=limit) throw new Error(`El tiempo ${tiempo.toFixed(3)} no corresponde a CAÍDO para un límite ${limit.toFixed(3)}.`);
+    const up=await s.from("pique_pilotos").update({tiempo_final_s:tiempo,condicion,gana_pique:outcome!=="SIN_GANADOR"&&lane.participacion_id===outcome}).eq("pique_piloto_id",lane.pique_piloto_id);
+    if(up.error) throw new Error(up.error.message);
+  }
+  const now=new Date().toISOString();
+  const up=await s.from("piques").update({estado:"CONFIRMADO",confirmado_at:now,ganador_participacion_id:outcome==="SIN_GANADOR"?null:outcome,sin_ganador:outcome==="SIN_GANADOR",decision_juez_pendiente:false,motivo_revision:motivo}).eq("pique_id",piqueId).eq("estado","EN_REVISION").select("pique_id").maybeSingle();
+  if(up.error||!up.data) throw new Error("La revisión cambió de estado antes de confirmar.");
+  const flowLanes=lanes.map((lane:any)=>({...lane,condicion:txt(form.get(`condicion_${lane.pique_piloto_id}`)),tiempo_final_s:num(form.get(`tiempo_${lane.pique_piloto_id}`))}));
+  await applyConfirmedSportingFlow(s,u,{...pique,ganador_participacion_id:outcome==="SIN_GANADOR"?null:outcome,sin_ganador:outcome==="SIN_GANADOR"},flowLanes);
+  await advanceBracketFromPique(s,u,{...pique,pique_id:piqueId,ganador_participacion_id:outcome==="SIN_GANADOR"?null:outcome,sin_ganador:outcome==="SIN_GANADOR"});
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,entidad:"piques",entidad_id:piqueId,accion:"JUEZ_CONFIRMA_DECISION",datos_antes:before,datos_despues:{ganador_participacion_id:outcome==="SIN_GANADOR"?null:outcome,sin_ganador:outcome==="SIN_GANADOR",confirmado_at:now},motivo});
+  revalidatePath("/admin/master-drag/juez");
+  revalidatePath("/admin/master-drag/cronometraje");
+}
+
+export async function judgeTechnicalRepeat(form:FormData){
+  const {s,u}=await operator();
+  if(!allowed(u.rol_global,"JUEZ")) throw new Error("Sin permiso para operar Juez.");
+  const piqueId=txt(form.get("pique_id"));
+  const motivo=txt(form.get("motivo"));
+  if(!piqueId||!motivo) throw new Error("La repetición técnica requiere fundamento.");
+  const {data:pique,error:pErr}=await s.from("piques").select("pique_id,categoria_fecha_id,ronda,estado,correlativo").eq("pique_id",piqueId).single();
+  if(pErr||!pique||pique.estado!=="EN_REVISION") throw new Error("Solo un pique EN REVISIÓN puede generar repetición técnica.");
+  const {data:lanes,error:lErr}=await s.from("pique_pilotos").select("participacion_id,pista,vehiculo_id").eq("pique_id",piqueId).order("pista");
+  if(lErr||!lanes?.length) throw new Error("El pique no tiene pilotos para repetir.");
+  const ins=await s.from("piques").insert({categoria_fecha_id:pique.categoria_fecha_id,ronda:pique.ronda,tipo:"REPETICION_TECNICA",estado:"PREPARADO",motivo_revision:motivo}).select("pique_id").single();
+  if(ins.error||!ins.data) throw new Error(ins.error?.message||"No se pudo crear la repetición.");
+  const cloned=lanes.map((l:any)=>({pique_id:ins.data.pique_id,participacion_id:l.participacion_id,pista:l.pista,vehiculo_id:l.vehiculo_id||null,condicion:null}));
+  const lp=await s.from("pique_pilotos").insert(cloned); if(lp.error) throw new Error(lp.error.message);
+  const rel=await s.from("repeticiones_pique").insert({pique_original_id:piqueId,pique_repeticion_id:ins.data.pique_id,tipo:"TECNICA",motivo}); if(rel.error) throw new Error(rel.error.message);
+  const old=await s.from("piques").update({estado:"ANULADO",decision_juez_pendiente:false,motivo_revision:motivo}).eq("pique_id",piqueId).eq("estado","EN_REVISION"); if(old.error) throw new Error(old.error.message);
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,entidad:"piques",entidad_id:piqueId,accion:"JUEZ_ORDENA_REPETICION_TECNICA",datos_despues:{pique_repeticion_id:ins.data.pique_id},motivo});
+  revalidatePath("/admin/master-drag/juez");
+  revalidatePath("/admin/master-drag/cronometraje");
+}
+
+
+
+
+export async function markCategoryNotConsidered(form:FormData){
+  const {s,u}=await operator();
+  if(!allowed(u.rol_global,"JUEZ")) throw new Error("Solo Juez o Administrador puede declarar una categoría NO CONSIDERADA.");
+  const categoriaFechaId=txt(form.get("categoria_fecha_id"));
+  const confirmacion=txt(form.get("confirmacion"));
+  if(confirmacion!=="NO CONSIDERADA") throw new Error("Debes confirmar escribiendo NO CONSIDERADA.");
+  const {data:cf,error:cfErr}=await s.from("categoria_fecha").select("categoria_fecha_id,fecha_id,categoria_id,estado,puntuacion_confirmada").eq("categoria_fecha_id",categoriaFechaId).single();
+  if(cfErr||!cf) throw new Error("Categoría no encontrada.");
+  const {data:fecha}=await s.from("fechas").select("fecha_id,estado").eq("fecha_id",cf.fecha_id).single();
+  if(String(fecha?.estado)!=="CONTINUACION") throw new Error("Una categoría incompleta solo puede declararse NO CONSIDERADA al finalizar la jornada de continuación.");
+  if(["OFICIAL","NO_CONSIDERADA"].includes(String(cf.estado))||cf.puntuacion_confirmada) throw new Error("Esta categoría ya está cerrada deportivamente y no puede convertirse en NO CONSIDERADA.");
+
+  const {data:parts}=await s.from("participaciones_categoria").select("participacion_id").eq("categoria_fecha_id",categoriaFechaId);
+  const {data:piques}=await s.from("piques").select("pique_id").eq("categoria_fecha_id",categoriaFechaId);
+  const piqueIds=(piques||[]).map((x:any)=>x.pique_id);
+  const {data:lanes}=piqueIds.length?await s.from("pique_pilotos").select("pique_piloto_id").in("pique_id",piqueIds):{data:[]};
+  const laneIds=(lanes||[]).map((x:any)=>x.pique_piloto_id);
+  const {data:results}=await s.from("resultados_categoria").select("resultado_id").eq("categoria_fecha_id",categoriaFechaId);
+
+  if(laneIds.length){const d=await s.from("estadisticas_piloto").delete().in("pique_piloto_id",laneIds);if(d.error)throw new Error(d.error.message);}
+  const db=await s.from("bracket_nodos").delete().eq("categoria_fecha_id",categoriaFechaId);if(db.error)throw new Error(db.error.message);
+  if(piqueIds.length){
+    const dr1=await s.from("repeticiones_pique").delete().in("pique_original_id",piqueIds);if(dr1.error)throw new Error(dr1.error.message);
+    const dr2=await s.from("repeticiones_pique").delete().in("pique_repeticion_id",piqueIds);if(dr2.error)throw new Error(dr2.error.message);
+  }
+  const dres=await s.from("resultados_categoria").delete().eq("categoria_fecha_id",categoriaFechaId);if(dres.error)throw new Error(dres.error.message);
+  const dp=await s.from("piques").delete().eq("categoria_fecha_id",categoriaFechaId);if(dp.error)throw new Error(dp.error.message);
+  const dpart=await s.from("participaciones_categoria").delete().eq("categoria_fecha_id",categoriaFechaId);if(dpart.error)throw new Error(dpart.error.message);
+  const up=await s.from("categoria_fecha").update({estado:"NO_CONSIDERADA",participantes_oficiales:0,habilita_puntos:false,podio_confirmado:false,puntuacion_confirmada:false,publicada:false}).eq("categoria_fecha_id",categoriaFechaId);if(up.error)throw new Error(up.error.message);
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,fecha_id:cf.fecha_id,entidad:"categoria_fecha",entidad_id:categoriaFechaId,accion:"JUEZ_DECLARA_CATEGORIA_NO_CONSIDERADA",datos_antes:{participaciones:(parts||[]).length,piques:piqueIds.length,resultados:(results||[]).length},datos_despues:{estado:"NO_CONSIDERADA",efecto_deportivo:"ELIMINADO",asistencia_general:"SE_CONSERVA"}});
+  revalidatePath("/admin/master-drag/juez");revalidatePath("/");
+}
+
+export async function closeDateDefinitely(form:FormData){
+  const {s,u}=await operator();
+  if(!allowed(u.rol_global,"JUEZ")) throw new Error("Solo Juez o Administrador puede cerrar definitivamente una fecha.");
+  const fechaId=txt(form.get("fecha_id"));
+  if(txt(form.get("confirmar_1"))!=="SI"||txt(form.get("confirmar_2"))!=="CERRAR FECHA") throw new Error("Falta la doble confirmación requerida para cerrar la fecha.");
+  const {data:fecha,error:fErr}=await s.from("fechas").select("fecha_id,temporada_id,numero_oficial,nombre,fecha_calendario_principal,autodromo,distancia_m,estado,tipo_evento").eq("fecha_id",fechaId).single();
+  if(fErr||!fecha) throw new Error("Fecha no encontrada.");
+  if(String(fecha.estado)==="CERRADA_DEFINITIV
