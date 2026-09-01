@@ -1,0 +1,127 @@
+"use server";
+import {revalidatePath} from "next/cache";
+import {operator,allowed} from "@/lib/admin";
+
+function txt(v:FormDataEntryValue|null){return String(v??"").trim()}
+function num(v:FormDataEntryValue|null){const n=Number(String(v??"").trim());return Number.isFinite(n)?n:null}
+
+
+const POINTS_BY_POSITION:Record<number,number>={1:25,2:20,3:18,4:16,5:14,6:12,7:10,8:8};
+const ROUND_LEVEL:Record<string,number>={PRIMERA:1,PERDEDORES:2,OTRA:3,CUARTOS:4,SEMIFINAL:5,FINAL:6};
+
+async function generateProvisionalCategoryResults(s:any,u:any,categoriaFechaId:string){
+  const {data:cf,error:cfErr}=await s.from("categoria_fecha").select("categoria_fecha_id,categoria_id,fecha_id,estado").eq("categoria_fecha_id",categoriaFechaId).single();
+  if(cfErr||!cf) throw new Error("No se encontró la categoría de la fecha.");
+  const {data:def}=await s.from("categorias").select("codigo,nombre,tiempo_limite_s").eq("categoria_id",cf.categoria_id).single();
+  const code=String(def?.codigo||def?.nombre||"").toUpperCase();
+  const isLibre=code.includes("LIBRE");
+  const limit=def?.tiempo_limite_s==null?null:Number(def.tiempo_limite_s);
+  const {data:parts,error:partsErr}=await s.from("participaciones_categoria").select("participacion_id,piloto_temporada_id,estado,participacion_deportiva,primer_pique_oficial_at").eq("categoria_fecha_id",categoriaFechaId).eq("retiro_definitivo",false);
+  if(partsErr) throw new Error(partsErr.message);
+  const official=(parts||[]).filter((x:any)=>x.participacion_deportiva||x.primer_pique_oficial_at);
+  if(!official.length) return;
+  const officialIds=official.map((x:any)=>String(x.participacion_id));
+  const {data:piques}=await s.from("piques").select("pique_id,ronda,correlativo,ganador_participacion_id,estado").eq("categoria_fecha_id",categoriaFechaId).eq("estado","CONFIRMADO").order("correlativo",{ascending:true});
+  const piqueIds=(piques||[]).map((x:any)=>x.pique_id);
+  const {data:lanes}=piqueIds.length?await s.from("pique_pilotos").select("pique_id,participacion_id,tiempo_final_s,condicion").in("pique_id",piqueIds).in("participacion_id",officialIds):{data:[]};
+  const piqueMap=new Map<string,any>((piques||[]).map((x:any)=>[String(x.pique_id),x]));
+  const history=new Map<string,any[]>();
+  for(const id of officialIds)history.set(id,[]);
+  for(const l of lanes||[]){const id=String(l.participacion_id);const p=piqueMap.get(String(l.pique_id));if(!p)continue;history.get(id)?.push({round:String(p.ronda),order:Number(p.correlativo||0),time:l.tiempo_final_s==null?null:Number(l.tiempo_final_s),condition:String(l.condicion||"")});}
+  for(const arr of history.values())arr.sort((a,b)=>a.order-b.order);
+  const finalPique=(piques||[]).filter((x:any)=>String(x.ronda)==="FINAL").at(-1);
+  const champion=finalPique?.ganador_participacion_id?String(finalPique.ganador_participacion_id):null;
+  const stage=(id:string)=>{if(id===champion)return 7;let m=0;for(const h of history.get(id)||[])m=Math.max(m,ROUND_LEVEL[h.round]||0);return m;};
+  const seq=(id:string)=>(history.get(id)||[]).slice().reverse().map((h:any)=>h.time==null?Number.POSITIVE_INFINITY:(limit==null?h.time:Math.abs(h.time-limit)));
+  const key=(id:string)=>({stage:stage(id),seq:seq(id)});
+  const compare=(a:string,b:string)=>{const A=key(a),B=key(b);if(A.stage!==B.stage)return B.stage-A.stage;const n=Math.max(A.seq.length,B.seq.length);for(let i=0;i<n;i++){const av=A.seq[i]??Number.POSITIVE_INFINITY,bv=B.seq[i]??Number.POSITIVE_INFINITY;if(av!==bv)return av-bv;}return a.localeCompare(b);};
+  const sameSportingKey=(a:string,b:string)=>{const A=key(a),B=key(b);if(A.stage!==B.stage||A.seq.length!==B.seq.length)return false;return A.seq.every((v:number,i:number)=>v===B.seq[i]);};
+  const ordered=officialIds.slice().sort(compare);
+  const positions=new Map<string,number>();let lastId:string|null=null,lastPos=0;
+  ordered.forEach((id,index)=>{const pos=lastId&&sameSportingKey(lastId,id)?lastPos:index+1;positions.set(id,pos);lastId=id;lastPos=pos;});
+  const validTimes=(lanes||[]).filter((l:any)=>l.condicion==="VALIDO"&&l.tiempo_final_s!=null).map((l:any)=>Number(l.tiempo_final_s));
+  const bestValid=validTimes.length?Math.min(...validTimes):null;
+  const puntuable=!isLibre&&official.length>=6;
+  const rows=officialIds.map((id:string)=>{
+    const pos=positions.get(id)||null;
+    const h=history.get(id)||[];
+    const hasExact=limit!=null&&h.some((x:any)=>x.condition==="VALIDO"&&x.time!=null&&Math.abs(x.time-limit)<0.0005);
+    const hasBest=bestValid!=null&&h.some((x:any)=>x.condition==="VALIDO"&&x.time!=null&&Math.abs(x.time-bestValid)<0.0005);
+    const base=puntuable?(pos&&pos<=8?(POINTS_BY_POSITION[pos]||0):5):0;
+    const exact=puntuable&&hasExact?2:0;
+    const best=puntuable&&hasBest&&!hasExact?1:0;
+    return {categoria_fecha_id:categoriaFechaId,participacion_id:id,posicion:pos,puntos_posicion:base,bono_exacto:exact,bono_mejor_tiempo:best,puntos_totales:base+exact+best,estado:"PROVISIONAL"};
+  });
+  const del=await s.from("resultados_categoria").delete().eq("categoria_fecha_id",categoriaFechaId).eq("estado","PROVISIONAL");if(del.error)throw new Error(del.error.message);
+  const ins=await s.from("resultados_categoria").insert(rows);if(ins.error)throw new Error(ins.error.message);
+  await s.from("categoria_fecha").update({participantes_oficiales:official.length,habilita_puntos:puntuable,puntuacion_confirmada:false}).eq("categoria_fecha_id",categoriaFechaId);
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,fecha_id:cf.fecha_id,entidad:"categoria_fecha",entidad_id:categoriaFechaId,accion:"SISTEMA_GENERA_RESULTADOS_PROVISIONALES",datos_despues:{participantes_oficiales:official.length,puntuable,categoria_libre:isLibre,mejor_tiempo_valido:bestValid}});
+}
+
+export async function confirmCategoryScoring(form:FormData){
+  const {s,u}=await operator();if(!allowed(u.rol_global,"JUEZ"))throw new Error("Solo Juez o Administrador puede confirmar puntuación.");
+  const categoriaFechaId=txt(form.get("categoria_fecha_id"));if(!categoriaFechaId)throw new Error("Categoría inválida.");
+  const {data:cf,error:cfErr}=await s.from("categoria_fecha").select("categoria_fecha_id,categoria_id,fecha_id,estado,puntuacion_confirmada").eq("categoria_fecha_id",categoriaFechaId).single();
+  if(cfErr||!cf)throw new Error("Categoría no encontrada.");
+  if(!["PROVISIONAL","OFICIAL"].includes(String(cf.estado)))throw new Error("La categoría todavía no tiene resultado provisional cerrado.");
+  const {data:results,error:rErr}=await s.from("resultados_categoria").select("resultado_id").eq("categoria_fecha_id",categoriaFechaId).eq("estado","PROVISIONAL");
+  if(rErr||!results?.length)throw new Error("No existen resultados provisionales para confirmar.");
+  const up=await s.from("resultados_categoria").update({estado:"OFICIAL"}).eq("categoria_fecha_id",categoriaFechaId).eq("estado","PROVISIONAL");if(up.error)throw new Error(up.error.message);
+  const cup=await s.from("categoria_fecha").update({estado:"OFICIAL",podio_confirmado:true,puntuacion_confirmada:true}).eq("categoria_fecha_id",categoriaFechaId);if(cup.error)throw new Error(cup.error.message);
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,fecha_id:cf.fecha_id,entidad:"categoria_fecha",entidad_id:categoriaFechaId,accion:"JUEZ_CONFIRMA_PUNTUACION"});
+  revalidatePath("/admin/master-drag/juez");revalidatePath("/");
+}
+
+
+
+async function seedBracketRound(s:any,u:any,categoriaFechaId:string,participantIds:string[]){
+  const ids=[...new Set(participantIds.map(String))];
+  if(!ids.length) return;
+  if(ids.length===1){
+    await s.from("participaciones_categoria").update({estado:"FINALIZADO"}).eq("participacion_id",ids[0]);
+    await s.from("categoria_fecha").update({estado:"PROVISIONAL",podio_confirmado:true}).eq("categoria_fecha_id",categoriaFechaId);
+    await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,entidad:"categoria_fecha",entidad_id:categoriaFechaId,accion:"SISTEMA_CAMPEON_SIN_RIVAL",datos_despues:{ganador_participacion_id:ids[0]}});
+    await generateProvisionalCategoryResults(s,u,categoriaFechaId);
+    return;
+  }
+  if(ids.length>16) throw new Error("El bracket automático actual admite hasta 16 pilotos en mata-mata.");
+  const round=ids.length<=2?"FINAL":ids.length<=4?"SEMIFINAL":ids.length<=8?"CUARTOS":"OTRA";
+  const existing=await s.from("bracket_nodos").select("bracket_nodo_id").eq("categoria_fecha_id",categoriaFechaId).eq("ronda",round).limit(1);
+  if(existing.data?.length) return;
+
+  const {data:cf}=await s.from("categoria_fecha").select("categoria_id").eq("categoria_fecha_id",categoriaFechaId).single();
+  const {data:def}=cf?await s.from("categorias").select("tiempo_limite_s").eq("categoria_id",cf.categoria_id).single():{data:null};
+  const limit=def?.tiempo_limite_s==null?null:Number(def.tiempo_limite_s);
+  const {data:ps}=await s.from("piques").select("pique_id,correlativo").eq("categoria_fecha_id",categoriaFechaId).eq("estado","CONFIRMADO").order("correlativo",{ascending:true});
+  const pids=(ps||[]).map((x:any)=>x.pique_id);const order=new Map<string,number>((ps||[]).map((x:any)=>[String(x.pique_id),Number(x.correlativo||0)]));
+  const {data:hist}=pids.length?await s.from("pique_pilotos").select("pique_id,participacion_id,tiempo_final_s,condicion").in("pique_id",pids).in("participacion_id",ids):{data:[]};
+  const lastValid=new Map<string,{time:number,order:number}>();
+  for(const r of hist||[]){if(r.condicion==="VALIDO"&&r.tiempo_final_s!=null){const o=order.get(String(r.pique_id))||0;const prev=lastValid.get(String(r.participacion_id));if(!prev||o>=prev.order)lastValid.set(String(r.participacion_id),{time:Number(r.tiempo_final_s),order:o});}}
+  ids.sort((a,b)=>{const aa=lastValid.get(a),bb=lastValid.get(b);if(aa&&!bb)return -1;if(!aa&&bb)return 1;if(!aa&&!bb)return a.localeCompare(b);if(limit!=null){const da=Math.abs(aa!.time-limit),db=Math.abs(bb!.time-limit);if(da!==db)return da-db;}return bb!.order-aa!.order;});
+
+  const target=2**Math.floor(Math.log2(ids.length));
+  const byeCount=2*target-ids.length;
+  const byeIds=ids.slice(0,byeCount);
+  const raceIds=ids.slice(byeCount);
+  const nodes:any[]=[];let ord=1;
+  for(const id of byeIds)nodes.push({categoria_fecha_id:categoriaFechaId,ronda:round,orden_nodo:ord++,participacion_a_id:id,participacion_b_id:null,ganador_participacion_id:id,es_bye:true,sin_ganador:false});
+  let lo=0,hi=raceIds.length-1;
+  while(lo<hi){nodes.push({categoria_fecha_id:categoriaFechaId,ronda:round,orden_nodo:ord++,participacion_a_id:raceIds[lo++],participacion_b_id:raceIds[hi--],es_bye:false,sin_ganador:false});}
+  const ins=await s.from("bracket_nodos").insert(nodes);if(ins.error)throw new Error(ins.error.message);
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,entidad:"categoria_fecha",entidad_id:categoriaFechaId,accion:"SISTEMA_GENERA_BRACKET",datos_despues:{ronda:round,pilotos:ids.length,byes:byeCount}});
+}
+
+async function advanceBracketFromPique(s:any,u:any,pique:any){
+  const {data:node}=await s.from("bracket_nodos").select("bracket_nodo_id,categoria_fecha_id,ronda").eq("pique_id",pique.pique_id).maybeSingle();
+  if(!node) return;
+  const win=pique.ganador_participacion_id?String(pique.ganador_participacion_id):null;
+  await s.from("bracket_nodos").update({ganador_participacion_id:win,sin_ganador:!!pique.sin_ganador}).eq("bracket_nodo_id",node.bracket_nodo_id);
+  const {data:nodes}=await s.from("bracket_nodos").select("bracket_nodo_id,ganador_participacion_id,sin_ganador,es_bye").eq("categoria_fecha_id",node.categoria_fecha_id).eq("ronda",node.ronda).order("orden_nodo");
+  if(!(nodes||[]).length||!(nodes||[]).every((n:any)=>n.ganador_participacion_id||n.sin_ganador)) return;
+  const winners=(nodes||[]).map((n:any)=>n.ganador_participacion_id).filter(Boolean).map(String);
+  if(node.ronda==="FINAL") return;
+  await seedBracketRound(s,u,String(node.categoria_fecha_id),winners);
+}
+
+async function applyConfirmedSportingFlow(s:any,u:any,pique:any,lanes:any[]){
+  const ronda=String(piq
