@@ -1,0 +1,3 @@
+.quickPreparedPilots span{font-size:11px;color:#929292}.cronoActions button:disabled{opacity:.35;cursor:not-allowed;filter:grayscale(1)}@media(max-width:850px){.readyValidation{grid-template-columns:1fr}.quickPreparedPilots article{grid-template-columns:1fr}}
+
+.opCancel{border:1px solid #7b2029;background:#240b0e;color:#ffb7bf;padding:11px 14px;font-size:10px;font-weight:950;cursor:pointer}.opCancel:hover{background:#3b0d12;color:#fff}.prestartRule{display:grid;gap:3px;border-left:3px solid #e19a22;padding:6px 10px;background:#17120a}.prestartRule b{font-size:9px;color:#f5b84b}.prestartRule span{font-size:10px;color:#9d9587}@media(max-width:700px){.cronoActions{align-items:stretch;flex-direction:column}.cronoActions form,.cronoActions button{width:100%}}
