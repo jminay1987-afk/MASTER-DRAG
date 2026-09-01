@@ -1,0 +1,128 @@
+1"));
+  const p2=txt(form.get("pista_2"));
+  if(!categoriaFechaId||!ronda||!p1) throw new Error("Debes seleccionar categoría, ronda y al menos Pista 1.");
+  if(p1&&p2&&p1===p2) throw new Error("Un mismo piloto no puede ocupar ambas pistas.");
+  const {data:cat}=await s.from("categoria_fecha").select("estado").eq("categoria_fecha_id",categoriaFechaId).single();
+  if(!cat) throw new Error("Categoría inválida.");
+  const catState=String(cat.estado);
+  if(["PROVISIONAL","OFICIAL","NO_CONSIDERADA"].includes(catState)) throw new Error("La categoría ya no admite nuevos piques.");
+  if(["PENDIENTE","PRIMERA_RONDA"].includes(catState)&&ronda!=="PRIMERA") throw new Error("La categoría está en Primera Ronda.");
+  if(catState==="PERDEDORES"&&ronda!=="PERDEDORES") throw new Error("La categoría está en Ronda de Perdedores.");
+  if(catState==="MATA_MATA"&&!["OTRA","CUARTOS","SEMIFINAL","FINAL"].includes(ronda)) throw new Error("La categoría está en Mata-Mata.");
+  const {data:parts}=await s.from("participaciones_categoria").select("participacion_id,estado,vehiculo_id").eq("categoria_fecha_id",categoriaFechaId).eq("retiro_definitivo",false);
+  const allowedIds=new Set((parts||[]).map((x:any)=>String(x.participacion_id)));
+  const vehicleByParticipation=new Map((parts||[]).map((x:any)=>[String(x.participacion_id),x.vehiculo_id||null]));
+  if(!allowedIds.has(p1)||(p2&&!allowedIds.has(p2))) throw new Error("Hay un piloto que no pertenece a esta categoría.");
+  const selected=[p1,p2].filter(Boolean);
+  if(ronda==="PRIMERA"||ronda==="PERDEDORES"){
+    const {data:rp}=await s.from("piques").select("pique_id").eq("categoria_fecha_id",categoriaFechaId).eq("ronda",ronda).eq("estado","CONFIRMADO");
+    const rids=(rp||[]).map((x:any)=>x.pique_id);
+    const {data:used}=rids.length?await s.from("pique_pilotos").select("participacion_id").in("pique_id",rids).in("participacion_id",selected):{data:[]};
+    if(used?.length) throw new Error(ronda==="PERDEDORES"?"Cada perdedor tiene una sola pasada en esta ronda.":"Ese piloto ya completó su Primera Ronda.");
+  }
+  const existing=await s.from("piques").select("pique_id,estado").eq("categoria_fecha_id",categoriaFechaId).in("estado",["PREPARADO","LISTO","EN_CURSO","EN_REVISION"]).limit(1);
+  if(existing.data?.length) throw new Error("Ya existe un pique abierto en esta categoría.");
+  let bracketMatchId:string|null=null;
+  if(["OTRA","CUARTOS","SEMIFINAL","FINAL"].includes(ronda)&&p2){
+    const {data:nodes}=await s.from("bracket_nodos").select("bracket_nodo_id,participacion_a_id,participacion_b_id").eq("categoria_fecha_id",categoriaFechaId).eq("ronda",ronda).is("pique_id",null).eq("es_bye",false);
+    const match=(nodes||[]).find((n:any)=>{const a=String(n.participacion_a_id),b=String(n.participacion_b_id);return (a===p1&&b===p2)||(a===p2&&b===p1)});
+    if(!match) throw new Error("Ese cruce no corresponde al bracket automático de la ronda.");
+    bracketMatchId=String(match.bracket_nodo_id);
+  }
+  const ins=await s.from("piques").insert({categoria_fecha_id:categoriaFechaId,ronda,estado:"PREPARADO"}).select("pique_id").single();
+  if(ins.error) throw new Error(ins.error.message);
+  const lanes:any[]=[{pique_id:ins.data.pique_id,participacion_id:p1,pista:"PISTA_1",vehiculo_id:vehicleByParticipation.get(p1)||null,condicion:null}];
+  if(p2) lanes.push({pique_id:ins.data.pique_id,participacion_id:p2,pista:"PISTA_2",vehiculo_id:vehicleByParticipation.get(p2)||null,condicion:null});
+  const lp=await s.from("pique_pilotos").insert(lanes); if(lp.error) throw new Error(lp.error.message);
+  if(bracketMatchId){const bn=await s.from("bracket_nodos").update({pique_id:ins.data.pique_id}).eq("bracket_nodo_id",bracketMatchId);if(bn.error)throw new Error(bn.error.message);}
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,entidad:"piques",entidad_id:ins.data.pique_id,accion:"CRONO_PREPARA_PIQUE",datos_despues:{categoria_fecha_id:categoriaFechaId,ronda,pista_1:p1,pista_2:p2||null}});
+  revalidatePath("/admin/master-drag/cronometraje");
+}
+
+async function validatePiqueReady(s:any,piqueId:string){
+  const {data:pique,error:pErr}=await s.from("piques").select("pique_id,categoria_fecha_id,ronda,estado").eq("pique_id",piqueId).single();
+  if(pErr||!pique) throw new Error("No se encontró el pique preparado.");
+  if(String(pique.estado)!=="PREPARADO") throw new Error("El pique ya no está en estado PREPARADO.");
+  const {data:cf,error:cfErr}=await s.from("categoria_fecha").select("categoria_fecha_id,fecha_id,estado").eq("categoria_fecha_id",pique.categoria_fecha_id).single();
+  if(cfErr||!cf) throw new Error("No se encontró la categoría del pique.");
+  const {data:fecha,error:fErr}=await s.from("fechas").select("estado").eq("fecha_id",cf.fecha_id).single();
+  if(fErr||!fecha) throw new Error("No se encontró la fecha del pique.");
+  if(!["EN_COMPETENCIA","CONTINUACION"].includes(String(fecha.estado))) throw new Error("PIQUE LISTO solo está disponible con la jornada de competencia activa.");
+  const ronda=String(pique.ronda),catState=String(cf.estado);
+  if(["PENDIENTE","PRIMERA_RONDA"].includes(catState)&&ronda!=="PRIMERA") throw new Error("La categoría está en Primera Ronda y este pique no corresponde a esa instancia.");
+  if(catState==="PERDEDORES"&&ronda!=="PERDEDORES") throw new Error("La categoría está en Ronda de Perdedores y este pique no corresponde a esa instancia.");
+  if(catState==="MATA_MATA"&&!["OTRA","CUARTOS","SEMIFINAL","FINAL"].includes(ronda)) throw new Error("La categoría está en Mata-Mata y la ronda preparada no corresponde.");
+  if(["PROVISIONAL","OFICIAL","NO_CONSIDERADA"].includes(catState)) throw new Error("La categoría ya está cerrada deportivamente y no admite PIQUE LISTO.");
+  const {data:lanes,error:lErr}=await s.from("pique_pilotos").select("participacion_id,pista").eq("pique_id",piqueId).order("pista");
+  if(lErr||!lanes?.length) throw new Error("El pique no tiene pilotos asociados.");
+  if(lanes.length>2) throw new Error("Un pique de Master Drag no puede tener más de dos pilotos.");
+  const ids=lanes.map((x:any)=>String(x.participacion_id));
+  if(new Set(ids).size!==ids.length) throw new Error("Un mismo piloto aparece duplicado en el pique.");
+  const {data:parts,error:partErr}=await s.from("participaciones_categoria").select("participacion_id,categoria_fecha_id,estado,retiro_definitivo").in("participacion_id",ids);
+  if(partErr||!parts||parts.length!==ids.length) throw new Error("Existe un piloto del pique que ya no está disponible en la categoría.");
+  for(const part of parts){
+    if(String(part.categoria_fecha_id)!==String(pique.categoria_fecha_id)) throw new Error("Existe un piloto preparado en una categoría incorrecta.");
+    if(part.retiro_definitivo) throw new Error("Existe un piloto retirado definitivamente en el pique.");
+    const st=String(part.estado);
+    if(ronda==="PRIMERA"&&!["INSCRITO","PRIMERA_RONDA"].includes(st)) throw new Error("Uno de los pilotos ya no está habilitado para Primera Ronda.");
+    if(ronda==="PERDEDORES"&&st!=="PERDEDORES") throw new Error("Uno de los pilotos ya no está habilitado para Ronda de Perdedores.");
+    if(["OTRA","CUARTOS","SEMIFINAL","FINAL"].includes(ronda)&&st!=="MATA_MATA") throw new Error("Uno de los pilotos ya no está habilitado para este cruce de Mata-Mata.");
+  }
+  if(ronda==="PRIMERA"||ronda==="PERDEDORES"){
+    const {data:donePiques}=await s.from("piques").select("pique_id").eq("categoria_fecha_id",pique.categoria_fecha_id).eq("ronda",ronda).eq("estado","CONFIRMADO");
+    const doneIds=(donePiques||[]).map((x:any)=>x.pique_id);
+    if(doneIds.length){
+      const {data:used}=await s.from("pique_pilotos").select("participacion_id").in("pique_id",doneIds).in("participacion_id",ids);
+      if(used?.length) throw new Error(ronda==="PRIMERA"?"Uno de los pilotos ya realizó su Primera Ronda.":"Uno de los pilotos ya realizó su única pasada de Perdedores.");
+    }
+  }
+  if(["OTRA","CUARTOS","SEMIFINAL","FINAL"].includes(ronda)){
+    const {data:nodes}=await s.from("bracket_nodos").select("participacion_a_id,participacion_b_id,pique_id,ganador_participacion_id,es_bye").eq("categoria_fecha_id",pique.categoria_fecha_id).eq("ronda",ronda);
+    const pair=[...ids].sort().join("|");
+    const ok=(nodes||[]).some((n:any)=>!n.es_bye&&String(n.pique_id||"")===String(piqueId)&&!n.ganador_participacion_id&&[String(n.participacion_a_id||""),String(n.participacion_b_id||"")].filter(Boolean).sort().join("|")===pair);
+    if(!ok) throw new Error("El pique preparado ya no coincide con el cruce pendiente del bracket.");
+  }
+  return {pique,cf,fecha,lanes};
+}
+
+export async function markPiqueReady(form:FormData){
+  const {s,u}=await operator(); if(!allowed(u.rol_global,"CRONOMETRAJE")) throw new Error("Sin permiso.");
+  const id=txt(form.get("pique_id")); if(!id) throw new Error("Pique inválido.");
+  const validated=await validatePiqueReady(s,id);
+  const up=await s.from("piques").update({estado:"LISTO"}).eq("pique_id",id).eq("estado","PREPARADO").select("pique_id").maybeSingle();
+  if(up.error||!up.data) throw new Error("El pique cambió de estado antes de completar la validación.");
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,fecha_id:validated.cf.fecha_id,entidad:"piques",entidad_id:id,accion:"CRONO_PIQUE_LISTO",datos_despues:{validaciones:{jornada:true,categoria:true,pilotos:true,ronda:true,duplicidad:true,bracket:true}}});
+  revalidatePath("/admin/master-drag/cronometraje");
+}
+
+export async function cancelPrestartPique(form:FormData){
+  const {s,u}=await operator(); if(!allowed(u.rol_global,"CRONOMETRAJE")) throw new Error("Sin permiso.");
+  const id=txt(form.get("pique_id")); if(!id) throw new Error("Pique inválido.");
+  const {data,error}=await s.rpc("cancel_prestart_pique",{p_pique_id:id});
+  if(error) throw new Error(error.message);
+  const info:any=data||{};
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,fecha_id:info.fecha_id||null,entidad:"piques",entidad_id:id,accion:"CRONO_CANCELA_PIQUE_ANTES_LARGADA",datos_antes:{estado:info.estado_anterior||null,ronda:info.ronda||null,pilotos:info.pilotos||[]},datos_despues:{cancelado_antes_largada:true,correlativo_consumido:false,efecto_deportivo:false}});
+  revalidatePath("/admin/master-drag/cronometraje");
+  revalidatePath("/admin/master-drag/juez");
+}
+
+
+async function ensureAttendanceFromParticipation(s:any,u:any,fechaId:string,participacionIds:string[]){
+  const ids=[...new Set(participacionIds.map(String).filter(Boolean))];
+  if(!ids.length)return;
+  const {data,error}=await s.rpc("register_attendance_from_participation",{p_fecha_id:fechaId,p_participacion_ids:ids});
+  if(error)throw new Error(error.message);
+  for(const row of data||[]) if(row.changed) await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,fecha_id:fechaId,entidad:"asistencias_fecha",entidad_id:row.piloto_id,accion:"SISTEMA_DETECTA_ASISTENCIA_POR_PARTICIPACION",datos_despues:{piloto_id:row.piloto_id,asistio:true,origen_asistencia:"PARTICIPACION_EFECTIVA"}});
+}
+
+export async function setPilotAttendance(form:FormData){
+  const {s,u}=await operator();
+  const canGrilla=allowed(u.rol_global,"GRILLA"),canJudge=allowed(u.rol_global,"JUEZ");
+  if(!canGrilla&&!canJudge)throw new Error("Solo Grilla, Juez o Administrador puede registrar check-in.");
+  const fechaId=txt(form.get("fecha_id")); const rut=txt(form.get("rut")).toUpperCase();
+  if(!fechaId||!rut)throw new Error("Debes indicar fecha y RUT del piloto.");
+  const {data:fecha,error:fErr}=await s.from("fechas").select("fecha_id,temporada_id,estado,continuation_started_at").eq("fecha_id",fechaId).single();
+  if(fErr||!fecha)throw new Error("Fecha no encontrada.");
+  if(["SUSPENDIDA","CERRADA_DEFINITIVAMENTE"].includes(String(fecha.estado)))throw new Error("No se puede registrar check-in mientras la fecha está suspendida o cerrada definitivamente.");
+  let {data:piloto,error:pErr}=await s.from("pilotos").select("piloto_id,rut,nombres,apellidos").eq("rut",rut).maybeSingle();
+  if(!pi
