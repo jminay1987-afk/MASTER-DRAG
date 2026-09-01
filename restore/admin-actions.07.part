@@ -1,0 +1,50 @@
+evalidatePath("/admin/master-drag/juez");revalidatePath("/admin/master-drag/cronometraje");revalidatePath("/admin/master-drag/grilla");revalidatePath("/");
+}
+
+export async function startContinuationDay(form:FormData){
+  const {s,u}=await operator();
+  if(!allowed(u.rol_global,"JUEZ")) throw new Error("Solo Juez o Administrador puede iniciar la jornada de continuación.");
+  const fechaId=txt(form.get("fecha_id"));
+  const fechaCalendario=txt(form.get("continuation_date"));
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(fechaCalendario)) throw new Error("Debes indicar la fecha calendario de la continuación.");
+  const {data:fecha,error:fErr}=await s.from("fechas").select("fecha_id,estado,suspension_count,continuation_started_at").eq("fecha_id",fechaId).single();
+  if(fErr||!fecha) throw new Error("Fecha no encontrada.");
+  if(String(fecha.estado)!=="SUSPENDIDA") throw new Error("Solo una fecha SUSPENDIDA puede iniciar su jornada de continuación.");
+  if(Number(fecha.suspension_count||0)!==1) throw new Error("La fecha no posee una suspensión válida para continuar.");
+  if(fecha.continuation_started_at) throw new Error("La jornada de continuación ya fue iniciada anteriormente.");
+  const now=new Date().toISOString();
+  const up=await s.from("fechas").update({estado:"CONTINUACION",continuation_started_at:now,continuation_date:fechaCalendario}).eq("fecha_id",fechaId).eq("estado","SUSPENDIDA").is("continuation_started_at",null).select("fecha_id").maybeSingle();
+  if(up.error||!up.data) throw new Error(up.error?.message||"No se pudo iniciar la continuación.");
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,fecha_id:fechaId,entidad:"fechas",entidad_id:fechaId,accion:"JUEZ_INICIA_DIA_CONTINUACION",datos_antes:{estado:"SUSPENDIDA"},datos_despues:{estado:"CONTINUACION",continuation_started_at:now,continuation_date:fechaCalendario}});
+  revalidatePath("/admin/master-drag/juez");revalidatePath("/admin/master-drag/cronometraje");revalidatePath("/admin/master-drag/grilla");revalidatePath("/");
+}
+
+
+export async function changeContinuationVehicle(form:FormData){
+  const {s,u}=await operator();
+  if(!allowed(u.rol_global,"JUEZ")) throw new Error("Solo Juez o Administrador puede cambiar el vehículo de continuación.");
+  const participacionId=txt(form.get("participacion_id"));
+  const marca=txt(form.get("marca"));
+  const modelo=txt(form.get("modelo"));
+  const patente=txt(form.get("patente")).toUpperCase();
+  if(!participacionId||(!marca&&!modelo&&!patente)) throw new Error("Debes indicar al menos un dato del nuevo vehículo.");
+  const {data:part,error:pErr}=await s.from("participaciones_categoria").select("participacion_id,categoria_fecha_id,vehiculo_id").eq("participacion_id",participacionId).single();
+  if(pErr||!part) throw new Error("Participación no encontrada.");
+  const {data:cf}=await s.from("categoria_fecha").select("fecha_id,estado").eq("categoria_fecha_id",part.categoria_fecha_id).single();
+  if(!cf) throw new Error("Categoría no encontrada.");
+  const {data:fecha}=await s.from("fechas").select("estado,continuation_started_at").eq("fecha_id",cf.fecha_id).single();
+  if(String(fecha?.estado)!=="CONTINUACION"||!fecha?.continuation_started_at) throw new Error("El cambio especial de vehículo solo está disponible durante la jornada de continuación.");
+  if(["PROVISIONAL","OFICIAL","NO_CONSIDERADA"].includes(String(cf.estado))) throw new Error("La categoría ya no admite cambio de vehículo.");
+  const {data:laneRefs}=await s.from("pique_pilotos").select("pique_id").eq("participacion_id",participacionId);
+  const piqueIds=(laneRefs||[]).map((x:any)=>x.pique_id);
+  if(piqueIds.length){
+    const {data:after}=await s.from("piques").select("pique_id,iniciado_at,estado").in("pique_id",piqueIds).gte("iniciado_at",fecha.continuation_started_at).not("iniciado_at","is",null).limit(1);
+    if(after?.length) throw new Error("El piloto ya realizó su primer pique oficial de la jornada de continuación; el vehículo quedó fijado para esta categoría.");
+  }
+  let vehicleId:string|null=null;
+  if(patente){const {data:v}=await s.from("vehiculos").select("vehiculo_id").eq("patente",patente).maybeSingle();if(v)vehicleId=v.vehiculo_id;}
+  if(!vehicleId){const ins=await s.from("vehiculos").insert({marca:marca||null,modelo:modelo||null,patente:patente||null}).select("vehiculo_id").single();if(ins.error||!ins.data)throw new Error(ins.error?.message||"No se pudo registrar el vehículo.");vehicleId=ins.data.vehiculo_id;}
+  const up=await s.from("participaciones_categoria").update({vehiculo_id:vehicleId}).eq("participacion_id",participacionId);if(up.error)throw new Error(up.error.message);
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,fecha_id:cf.fecha_id,entidad:"participaciones_categoria",entidad_id:participacionId,accion:"JUEZ_CAMBIA_VEHICULO_CONTINUACION",datos_antes:{vehiculo_id:part.vehiculo_id},datos_despues:{vehiculo_id:vehicleId,marca:marca||null,modelo:modelo||null,patente:patente||null}});
+  revalidatePath("/admin/master-drag/juez");revalidatePath("/admin/master-drag/cronometraje");
+}
