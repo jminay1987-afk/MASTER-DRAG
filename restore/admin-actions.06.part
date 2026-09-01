@@ -1,0 +1,109 @@
+AMENTE") throw new Error("La fecha ya está cerrada definitivamente.");
+  if(String(fecha.estado)==="SUSPENDIDA") throw new Error("No se puede cerrar una fecha con continuación pendiente.");
+
+  const {data:cfs,error:cfErr}=await s.from("categoria_fecha").select("categoria_fecha_id,categoria_id,estado,participantes_oficiales,habilita_puntos,podio_confirmado,puntuacion_confirmada").eq("fecha_id",fechaId).order("orden_operativo");
+  if(cfErr) throw new Error(cfErr.message);
+  const pendientes=(cfs||[]).filter((x:any)=>!["OFICIAL","NO_CONSIDERADA"].includes(String(x.estado)));
+  if(pendientes.length) throw new Error(`No se puede cerrar: ${pendientes.length} categoría(s) siguen incompletas o provisionales.`);
+  const sinPuntuacion=(cfs||[]).filter((x:any)=>String(x.estado)==="OFICIAL"&&!x.puntuacion_confirmada);
+  if(sinPuntuacion.length) throw new Error(`No se puede cerrar: ${sinPuntuacion.length} categoría(s) oficiales aún no tienen puntuación confirmada.`);
+
+  const cfIds=(cfs||[]).map((x:any)=>x.categoria_fecha_id);
+  const {data:piques}=cfIds.length?await s.from("piques").select("pique_id,categoria_fecha_id,estado,decision_juez_pendiente,correlativo,ronda").in("categoria_fecha_id",cfIds):{data:[]};
+  const unresolved=(piques||[]).filter((p:any)=>p.decision_juez_pendiente||!["CONFIRMADO","ANULADO"].includes(String(p.estado)));
+  if(unresolved.length) throw new Error(`No se puede cerrar: existen ${unresolved.length} pique(s), revisiones o decisiones sin resolver.`);
+  const piqueIds=(piques||[]).map((x:any)=>x.pique_id);
+  const {data:reps}=piqueIds.length?await s.from("repeticiones_pique").select("repeticion_id,pique_original_id,pique_repeticion_id").in("pique_original_id",piqueIds):{data:[]};
+  if(reps?.length){const repIds=reps.map((x:any)=>x.pique_repeticion_id);const {data:repPiques}=await s.from("piques").select("pique_id,estado,decision_juez_pendiente").in("pique_id",repIds);const pendingRep=(repPiques||[]).filter((p:any)=>p.decision_juez_pendiente||!["CONFIRMADO","ANULADO"].includes(String(p.estado)));if(pendingRep.length)throw new Error(`No se puede cerrar: existen ${pendingRep.length} repetición(es) pendientes.`);}
+
+  const catIds=(cfs||[]).map((x:any)=>x.categoria_id);const {data:defs}=catIds.length?await s.from("categorias").select("categoria_id,codigo,nombre,tiempo_limite_s").in("categoria_id",catIds):{data:[]};
+  const defMap=new Map((defs||[]).map((x:any)=>[String(x.categoria_id),x]));
+  const {data:results}=cfIds.length?await s.from("resultados_categoria").select("categoria_fecha_id,participacion_id,posicion,puntos_posicion,bono_exacto,bono_mejor_tiempo,puntos_totales,estado").in("categoria_fecha_id",cfIds).eq("estado","OFICIAL").order("posicion"): {data:[]};
+  const {data:lanes}=piqueIds.length?await s.from("pique_pilotos").select("pique_id,participacion_id,tiempo_final_s,condicion").in("pique_id",piqueIds):{data:[]};
+  const piqueCf=new Map((piques||[]).map((p:any)=>[String(p.pique_id),String(p.categoria_fecha_id)]));
+  const bestByCf=new Map<string,number>();
+  for(const l of lanes||[]){if(l.condicion!=="VALIDO"||l.tiempo_final_s==null)continue;const cid=String(piqueCf.get(String(l.pique_id))||"");if(!cid)continue;const t=Number(l.tiempo_final_s),prev=bestByCf.get(cid);if(prev==null||t<prev)bestByCf.set(cid,t);}
+  const categorias=(cfs||[]).map((cf:any)=>{const def:any=defMap.get(String(cf.categoria_id));return {categoria_fecha_id:cf.categoria_fecha_id,categoria_id:cf.categoria_id,codigo:def?.codigo||null,nombre:def?.nombre||null,estado:cf.estado,participantes_oficiales:cf.participantes_oficiales,habilita_puntos:cf.habilita_puntos,mejor_tiempo_valido:bestByCf.get(String(cf.categoria_fecha_id))??null,resultados:(results||[]).filter((r:any)=>r.categoria_fecha_id===cf.categoria_fecha_id)};});
+  const {data:attendance}=await s.from("asistencias_fecha").select("piloto_id,asistio").eq("fecha_id",fechaId).eq("asistio",true);
+  const resumen={estado:"OFICIAL",fecha:{...fecha,estado:"CERRADA_DEFINITIVAMENTE"},categorias,asistencia_total:(attendance||[]).length,revisiones_pendientes:0,piques_sin_resolver:0,generado_at:new Date().toISOString()};
+  const {data:last}=await s.from("fecha_resumenes").select("version").eq("fecha_id",fechaId).order("version",{ascending:false}).limit(1);
+  const version=(last?.[0]?.version||0)+1;
+  const ins=await s.from("fecha_resumenes").insert({fecha_id:fechaId,version,generado_por_usuario_id:u.usuario_id,contenido_json:resumen}).select("resumen_id").single();if(ins.error)throw new Error(ins.error.message);
+  const close=await s.from("fechas").update({estado:"CERRADA_DEFINITIVAMENTE",cierre_definitivo_at:new Date().toISOString()}).eq("fecha_id",fechaId);if(close.error)throw new Error(close.error.message);
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,fecha_id:fechaId,entidad:"fechas",entidad_id:fechaId,accion:"CIERRA_FECHA_DEFINITIVAMENTE",datos_despues:{resumen_id:ins.data.resumen_id,version,categorias_realizadas:categorias.filter((x:any)=>x.estado==="OFICIAL").length,categorias_no_consideradas:categorias.filter((x:any)=>x.estado==="NO_CONSIDERADA").length,asistencia_total:(attendance||[]).length}});
+  revalidatePath("/admin/master-drag/juez");revalidatePath("/admin/master-drag");revalidatePath("/");
+}
+export async function publishRankingSnapshot(form:FormData){
+  const {s,u}=await operator();
+  if(!allowed(u.rol_global,"JUEZ")) throw new Error("Solo Juez o Administrador puede publicar el ranking.");
+  const temporadaId=txt(form.get("temporada_id"));
+  const categoriaId=txt(form.get("categoria_id"));
+  if(!temporadaId||!categoriaId) throw new Error("Temporada o categoría inválida.");
+
+  const {data:defs,error:defErr}=await s.from("categorias").select("categoria_id,codigo,nombre").eq("categoria_id",categoriaId).single();
+  if(defErr||!defs) throw new Error("No se encontró la categoría.");
+  const {data:temporada,error:tErr}=await s.from("temporadas").select("temporada_id,anio,nombre").eq("temporada_id",temporadaId).single();
+  if(tErr||!temporada) throw new Error("No se encontró la temporada.");
+  const {data:fechas,error:fErr}=await s.from("fechas").select("fecha_id").eq("temporada_id",temporadaId).eq("tipo_evento","MASTER_DRAG");
+  if(fErr) throw new Error(fErr.message);
+  const fechaIds=(fechas||[]).map((x:any)=>x.fecha_id);
+  if(!fechaIds.length) throw new Error("La temporada no tiene fechas Master Drag.");
+  const {data:cfs,error:cfErr}=await s.from("categoria_fecha").select("categoria_fecha_id,fecha_id").eq("categoria_id",categoriaId).eq("puntuacion_confirmada",true).in("fecha_id",fechaIds);
+  if(cfErr) throw new Error(cfErr.message);
+  const cfIds=(cfs||[]).map((x:any)=>x.categoria_fecha_id);
+  if(!cfIds.length) throw new Error("No existen puntuaciones confirmadas para publicar en esta categoría.");
+
+  const {data:res,error:rErr}=await s.from("resultados_categoria").select("categoria_fecha_id,participacion_id,puntos_posicion,bono_exacto,bono_mejor_tiempo,puntos_totales").in("categoria_fecha_id",cfIds).eq("estado","OFICIAL");
+  if(rErr) throw new Error(rErr.message);
+  if(!res?.length) throw new Error("No existen resultados oficiales para publicar.");
+  const partIds=[...new Set(res.map((r:any)=>r.participacion_id))];
+  const {data:parts,error:pErr}=await s.from("participaciones_categoria").select("participacion_id,piloto_temporada_id").in("participacion_id",partIds);
+  if(pErr) throw new Error(pErr.message);
+  const ptIds=[...new Set((parts||[]).map((x:any)=>x.piloto_temporada_id))];
+  const {data:pts,error:ptErr}=await s.from("piloto_temporada").select("piloto_temporada_id,piloto_id,numero_competencia").in("piloto_temporada_id",ptIds);
+  if(ptErr) throw new Error(ptErr.message);
+  const pilotoIds=[...new Set((pts||[]).map((x:any)=>x.piloto_id))];
+  const {data:pis,error:piErr}=await s.from("pilotos").select("piloto_id,nombres,apellidos").in("piloto_id",pilotoIds);
+  if(piErr) throw new Error(piErr.message);
+
+  const cfMap=new Map((cfs||[]).map((x:any)=>[x.categoria_fecha_id,x]));
+  const partMap=new Map((parts||[]).map((x:any)=>[x.participacion_id,x]));
+  const ptMap=new Map((pts||[]).map((x:any)=>[x.piloto_temporada_id,x]));
+  const piMap=new Map((pis||[]).map((x:any)=>[x.piloto_id,x]));
+  const rows=new Map<string,any>();
+  for(const r of res){
+    const part:any=partMap.get(r.participacion_id); const pt:any=part?ptMap.get(part.piloto_temporada_id):null; const pi:any=pt?piMap.get(pt.piloto_id):null; const cf:any=cfMap.get(r.categoria_fecha_id);
+    if(!part||!pt||!pi||!cf) continue;
+    let row=rows.get(pt.piloto_temporada_id);
+    if(!row){row={piloto_temporada_id:pt.piloto_temporada_id,numero_competencia:pt.numero_competencia,piloto:`${pi.nombres} ${pi.apellidos}`,fechas:new Set<string>(),puntos_base:0,bonos:0,total:0};rows.set(pt.piloto_temporada_id,row)}
+    row.fechas.add(cf.fecha_id); row.puntos_base+=Number(r.puntos_posicion||0); row.bonos+=Number(r.bono_exacto||0)+Number(r.bono_mejor_tiempo||0); row.total+=Number(r.puntos_totales||0);
+  }
+  const ranking=[...rows.values()].map((x:any)=>({...x,fechas:x.fechas.size})).sort((a:any,b:any)=>b.total-a.total||a.numero_competencia-b.numero_competencia);
+  let prev:number|null=null,pos=0; ranking.forEach((r:any,i:number)=>{if(prev===null||r.total!==prev)pos=i+1;prev=r.total;r.posicion=pos});
+  const {data:last}=await s.from("ranking_snapshots").select("version").eq("temporada_id",temporadaId).eq("categoria_id",categoriaId).order("version",{ascending:false}).limit(1);
+  const version=(last?.[0]?.version||0)+1;
+  const contenido={estado:"PROVISIONAL",temporada:{temporada_id:temporadaId,anio:temporada.anio,nombre:temporada.nombre},categoria:{categoria_id:categoriaId,codigo:defs.codigo,nombre:defs.nombre},temporada_id:temporadaId,version,ranking};
+  const ins=await s.from("ranking_snapshots").insert({temporada_id:temporadaId,categoria_id:categoriaId,version,contenido_json:contenido}).select("snapshot_id").single();
+  if(ins.error) throw new Error(ins.error.message);
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,entidad:"ranking_snapshots",entidad_id:ins.data.snapshot_id,accion:"PUBLICA_RANKING_ACTUALIZADO",datos_despues:{temporada_id:temporadaId,categoria_id:categoriaId,version}});
+  revalidatePath("/"); revalidatePath("/admin/master-drag/juez");
+}
+
+
+export async function suspendDate(form:FormData){
+  const {s,u}=await operator();
+  if(!allowed(u.rol_global,"JUEZ")) throw new Error("Solo Juez o Administrador puede suspender una fecha.");
+  const fechaId=txt(form.get("fecha_id"));
+  const motivo=txt(form.get("motivo"));
+  if(!motivo) throw new Error("El motivo de suspensión es obligatorio.");
+  const {data:fecha,error:fErr}=await s.from("fechas").select("fecha_id,estado,suspension_count").eq("fecha_id",fechaId).single();
+  if(fErr||!fecha) throw new Error("Fecha no encontrada.");
+  if(String(fecha.estado)==="CERRADA_DEFINITIVAMENTE") throw new Error("Una fecha cerrada definitivamente no puede suspenderse.");
+  if(String(fecha.estado)==="SUSPENDIDA") throw new Error("La fecha ya está suspendida.");
+  if(String(fecha.estado)==="CONTINUACION"||Number(fecha.suspension_count||0)>=1) throw new Error("Master Drag permite como máximo una suspensión y una jornada de continuación por fecha.");
+  if(!["EN_COMPETENCIA","PREPARACION"].includes(String(fecha.estado))) throw new Error("La fecha no está en un estado que permita suspensión.");
+  const now=new Date().toISOString();
+  const up=await s.from("fechas").update({estado:"SUSPENDIDA",suspension_count:1,suspended_at:now,suspension_reason:motivo}).eq("fecha_id",fechaId).neq("estado","CERRADA_DEFINITIVAMENTE").select("fecha_id").maybeSingle();
+  if(up.error||!up.data) throw new Error(up.error?.message||"No se pudo suspender la fecha.");
+  await s.from("auditoria_eventos").insert({usuario_id:u.usuario_id,fecha_id:fechaId,entidad:"fechas",entidad_id:fechaId,accion:"JUEZ_SUSPENDE_FECHA",datos_antes:{estado:fecha.estado},datos_despues:{estado:"SUSPENDIDA",suspension_count:1,suspended_at:now},motivo});
+  r
